@@ -1,0 +1,3 @@
+[submodule "pocsag"]
+	path = pocsag
+	url = https://git.cheetah.cat/cheetah/python-pocsag.git
