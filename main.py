@@ -6,6 +6,8 @@ import lgpio
 import spidev
 import structlog
 
+from pocsag.pocsag import encodeTXBatch
+
 logger = structlog.get_logger()
 
 
@@ -36,6 +38,11 @@ class Board:
         if type(payload) == int:
             payload = [payload]
         self.spi.xfer([register | 0x80] + payload)
+
+    def spi_raw_write(self, register: int, payload: bytes | int):
+        if type(payload) == int:
+            payload = [payload]
+        self.spi.xfer([register] + payload)
 
     def __init__(self, spi_channel: int, interrupt_pin: int, reset_pin: int):
         self.spi_channel = spi_channel
@@ -85,16 +92,17 @@ class Board:
             self.log.error("Invalid board version")
             return
 
+
         # Sleep + FSK mode + FSK modulation = 00000000 (p87)
-        self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x00)
+        self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x08)
         time.sleep(0.1)
 
         # The board defaults to LongRange (LoRa) mode, at 0x80
         # Lets check we actually wrote the change to FSK
         op_mode = self.spi_read(BoardRegisters.REG_01_OP_MODE.value, 1)
-        if op_mode != 0x00:
+        if op_mode != 0x08:
             self.log.error("Failed to set op mode", op_mode=op_mode)
-            return
+            raise ValueError("Failed to set op mode")
 
         # Set standby mode
         self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
@@ -117,11 +125,68 @@ class Board:
         # You must hold an amateur radio license to transmit on this frequency
         fstep = 32000000.0 / 524288
         frf = int((439.9875 * 1000000) / fstep)
+        #frf = 0x6c8000
         self.spi_write(0x06, (frf >> 16) & 0xFF)
         self.spi_write(0x07, (frf >> 8) & 0xFF)
         self.spi_write(0x08, frf & 0xFF)
 
-        self.log.info("Frequency set")
+        self.log.info("Frequency set", frf=hex(frf))
+
+        self.spi_write(0x0, 12)
+
+    def send_message(self, ric: str, message: str) -> bool:
+        # encode a test
+        send_log = self.log.bind(ric=ric, message=message)
+        send_log.info("Encoding message", )
+        # Format = [ IsNumeric, Address(also supports A,B,C,D suffix like "133703C"), Message ]
+        data = encodeTXBatch([[False, ric, message]], inverted=True)
+        send_log.info("Encoded data", data=data)
+
+        # Set FiFo threshold to 32 bytes
+        self.spi_write(0x35, 0xa0)
+
+        # Turn off the sync bits
+        self.spi_write(0x27, 0x0)
+
+        # Set exit condition to FiFo empty
+        self.spi_write(0x35, 0x04)
+
+        # Set to beginning of Fifo
+        self.spi_write(0x0d, 0)
+
+        # briefly set RX Mode to clear Fifo
+        self.spi_write(0x01, 0x05)
+        time.sleep(0.1)
+        # Set standby mode
+        self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
+
+        is_first_data = True
+        num_bytes = 0
+        while(num_bytes < len(data)):
+            irq_flags = [1 if self.spi_read(0x3f, 1) & (1 << (7-n)) else 0 for n in range(8)]
+            fifo_full = irq_flags[0]
+            fifo_level = irq_flags[2]
+            fifo_overrun = irq_flags[3]
+
+            if fifo_overrun:
+                send_log.error("Fifo overrun")
+                return False
+
+            # It's not full, and we still have some data to send
+            if fifo_full or fifo_level:
+                continue
+
+            # Write the data to the FIFO
+            self.spi_write(0x00, data[num_bytes:num_bytes+16])
+            num_bytes += 16
+
+            # If this is the first data, set the DIO0 to Tx
+            if is_first_data:
+                send_log.info("TX Mode")
+                self.spi_write(0x01, 0x03)
+                is_first_data = False
+
+        return True
 
 
 @click.command()
@@ -130,6 +195,7 @@ class Board:
 @click.option("--reset-pin", default=12, help="Reset pin for the LoRa chip")
 def run(spi_channel, interrupt_pin, reset_pin):
     board = Board(spi_channel, interrupt_pin, reset_pin)
+    board.send_message("1542350", "HACK THE PLANET")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ lgpio = "*"
 spidev = "*"
 structlog = "*"
 click = "*"
+rich = "*"
 
 [dev-packages]
 
