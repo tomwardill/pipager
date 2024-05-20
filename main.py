@@ -6,7 +6,7 @@ import lgpio
 import spidev
 import structlog
 
-from pocsag.pocsag import encodeTXBatch
+from pocsag.pocsag import encodeTXBatch, encodeTransmission
 
 logger = structlog.get_logger()
 
@@ -17,6 +17,8 @@ class BoardRegisters(Enum):
 
 class Board:
 
+    is_transmitting = False
+
     def _handle_interrupt(self, chip, gpio_pin, gpio_level, timestamp):
         self.log.info(
             "Interupt detected",
@@ -25,6 +27,16 @@ class Board:
             gpio_level=gpio_level,
             timestamp=timestamp,
         )
+        first_read = self.spi_read(0x3e, 1)
+        first_irq =  [1 if first_read & (1 << (7-n)) else 0 for n in range(8)]
+        second_read = self.spi_read(0x3f, 1)
+        second_irq = [1 if second_read & (1 << (7-n)) else 0 for n in range(8)]
+
+        self.log.info("IRQ Flags", first_irq=first_irq, second_irq=second_irq)
+
+        if second_irq[4]:
+            self.is_transmitting = False
+            self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
 
     def spi_read(self, register: int, length: int):
         if length == 1:
@@ -37,7 +49,10 @@ class Board:
     def spi_write(self, register: int, payload: bytes | int):
         if type(payload) == int:
             payload = [payload]
-        self.spi.xfer([register | 0x80] + payload)
+            self.spi.xfer([register | 0x80] + payload)
+        else:
+            #self.log.info("Writing to register", register=register, payload=payload)
+            self.spi.xfer2([register | 0x80] + payload)
 
     def spi_raw_write(self, register: int, payload: bytes | int):
         if type(payload) == int:
@@ -92,6 +107,8 @@ class Board:
             self.log.error("Invalid board version")
             return
 
+        # Set standby mode
+        self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
 
         # Sleep + FSK mode + FSK modulation = 00000000 (p87)
         self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x08)
@@ -104,13 +121,13 @@ class Board:
             self.log.error("Failed to set op mode", op_mode=op_mode)
             raise ValueError("Failed to set op mode")
 
-        # Set standby mode
-        self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
 
         # Set modem config
         # https://github.com/AaronJackson/rfm69-pocsag/blob/main/rfm69-pocsag/rfm69-pocsag.ino#L43
         self.spi_write(0x02, 0x68)  # RegBitrateMsb
         self.spi_write(0x03, 0x2B)  # RegBitrateLsb
+        #self.spi_write(0x02, 0x06)  # RegBitrateMsb
+        #self.spi_write(0x03, 0x83)  # RegBitrateLsb
         self.spi_write(0x04, 0x00)  # RegFdevMsb
         self.spi_write(0x05, 0x4A)  # RegFdevLsb
 
@@ -123,8 +140,11 @@ class Board:
         # Set frequency
         # 439.9875 is a licensed frequency (at least in the UK)
         # You must hold an amateur radio license to transmit on this frequency
+
         fstep = 32000000.0 / 524288
-        frf = int((439.9875 * 1000000) / fstep)
+        # This is _actually_ 439.9875, but is offset for a reason I haven't
+        # discovered yet. Validated with an SDR and an actual pager.
+        frf = int((439.99350 * 1000000) / fstep)
         #frf = 0x6c8000
         self.spi_write(0x06, (frf >> 16) & 0xFF)
         self.spi_write(0x07, (frf >> 8) & 0xFF)
@@ -132,15 +152,20 @@ class Board:
 
         self.log.info("Frequency set", frf=hex(frf))
 
-        self.spi_write(0x0, 12)
+        val = (1 << 7) | (0x05) | (0x05)
+        self.spi_write(0x09, val)
 
     def send_message(self, ric: str, message: str) -> bool:
         # encode a test
         send_log = self.log.bind(ric=ric, message=message)
         send_log.info("Encoding message", )
         # Format = [ IsNumeric, Address(also supports A,B,C,D suffix like "133703C"), Message ]
-        data = encodeTXBatch([[False, ric, message]], inverted=True)
-        send_log.info("Encoded data", data=data)
+        data = encodeTXBatch([[False, ric, message]], inverted=False, repeatNum=1)
+        #data = encodeTransmission(False, 0, "1542350", )
+        send_log.info("Encoded data", data=data, length=len(data))
+
+        # Disable CRC checking as we do that ourselves via POCSAG
+        self.spi_write(0x30, 0x80)
 
         # Set FiFo threshold to 32 bytes
         self.spi_write(0x35, 0xa0)
@@ -160,8 +185,14 @@ class Board:
         # Set standby mode
         self.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
 
+        self.is_transmitting = True
+
+        with open("pi-hacktheplanet", 'wb') as f:
+            f.write(bytes(data))
+
         is_first_data = True
         num_bytes = 0
+
         while(num_bytes < len(data)):
             irq_flags = [1 if self.spi_read(0x3f, 1) & (1 << (7-n)) else 0 for n in range(8)]
             fifo_full = irq_flags[0]
@@ -177,8 +208,8 @@ class Board:
                 continue
 
             # Write the data to the FIFO
-            self.spi_write(0x00, data[num_bytes:num_bytes+16])
-            num_bytes += 16
+            self.spi_write(0x00, data[num_bytes:num_bytes+32])
+            num_bytes += 32
 
             # If this is the first data, set the DIO0 to Tx
             if is_first_data:
@@ -195,7 +226,9 @@ class Board:
 @click.option("--reset-pin", default=12, help="Reset pin for the LoRa chip")
 def run(spi_channel, interrupt_pin, reset_pin):
     board = Board(spi_channel, interrupt_pin, reset_pin)
-    board.send_message("1542350", "HACK THE PLANET")
+    board.send_message("1542350", "This is a test message")
+    time.sleep(5)
+    board.spi_write(BoardRegisters.REG_01_OP_MODE.value, 0x01)
 
 
 if __name__ == "__main__":
